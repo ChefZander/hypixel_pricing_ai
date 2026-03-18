@@ -5,17 +5,20 @@ import io
 import nbtlib
 import numpy as np
 import zlib
+import os
 from tqdm import tqdm
 
 DB_NAME = "skyblock_auctions.db"
 OUTPUT_FILE = "training_data.npz"
-VECTOR_SIZE = 1024 * 2 * 2 * 2 * 2
+VECTOR_SIZE = 16384 
 
 def decode_nbt(b64_string):
-    data = base64.b64decode(b64_string)
-    with gzip.GzipFile(fileobj=io.BytesIO(data)) as f:
-        uncompressed_data = f.read()
-        return nbtlib.File.parse(io.BytesIO(uncompressed_data))
+    try:
+        data = base64.b64decode(b64_string)
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as f:
+            return nbtlib.File.parse(io.BytesIO(f.read()))
+    except:
+        return None
 
 def flatten_nbt(nbt_data, prefix=""):
     items = []
@@ -31,43 +34,36 @@ def flatten_nbt(nbt_data, prefix=""):
 
 def process_to_vector(item_bytes, vector_size):
     vec = np.zeros(vector_size, dtype=np.float32)
-    
     nbt = decode_nbt(item_bytes)
     if nbt:
         tags = flatten_nbt(nbt)
         for t in tags:
             idx = zlib.adler32(t.encode('utf-8')) % vector_size
             vec[idx] += 1.0
-    else: print("NBT is None")
-    
     return np.log1p(vec)
 
 conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
-
-cursor.execute("SELECT COUNT(*) FROM auctions")
+cursor.execute("SELECT COUNT(*) FROM auctions WHERE price > 0")
 total = cursor.fetchone()[0]
 
-cursor.execute("SELECT item_bytes, price FROM auctions")
+x_mmap = np.memmap('x_temp.dat', dtype='float32', mode='w+', shape=(total, VECTOR_SIZE))
+y_mmap = np.memmap('y_temp.dat', dtype='float32', mode='w+', shape=(total,))
 
-inputs = []
-outputs = []
+cursor.execute("SELECT item_bytes, price FROM auctions WHERE price > 0")
 
-print(f"Processing {total} auctions...")
-for item_bytes, price in tqdm(cursor, total=total):
-    if price <= 0: continue
-    
-    vector = process_to_vector(item_bytes, VECTOR_SIZE)
+print(f"Processing {total} auctions to disk...")
+for i, (item_bytes, price) in enumerate(tqdm(cursor, total=total)):
+    x_mmap[i] = process_to_vector(item_bytes, VECTOR_SIZE)
+    y_mmap[i] = np.log10(price)
 
-    log_price = np.log10(price)
-    
-    inputs.append(vector)
-    outputs.append(log_price)
-    
+print("Compressing and saving final file...")
+np.savez_compressed(OUTPUT_FILE, x=x_mmap, y=y_mmap)
+
 conn.close()
+del x_mmap
+del y_mmap
+os.remove('x_temp.dat')
+os.remove('y_temp.dat')
 
-x_data = np.array(inputs, dtype=np.float32)
-y_data = np.array(outputs, dtype=np.float32)
-
-np.savez_compressed(OUTPUT_FILE, x=x_data, y=y_data)
-print(f"Saved {len(x_data)} samples to {OUTPUT_FILE}")
+print(f"Done! Saved to {OUTPUT_FILE}")
